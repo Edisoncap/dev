@@ -1,0 +1,186 @@
+/* OPS Handover — Edge bookmarklet source
+ * Scope: activates only on https://pbs-ops.deepwater.com/apps/Transocean/#_frmHOCreate
+ * Data stays in this browser's localStorage. It does not send data anywhere.
+ */
+(function () {
+  'use strict';
+
+  var FORM_ID = 'frmHOCreate';
+  var ROUTE = '#_frmHOCreate';
+  var STORAGE_PREFIX = 'ops-handover:v2:';
+  var SESSION_KEY = STORAGE_PREFIX + 'session';
+  var DRAFTS_KEY = STORAGE_PREFIX + 'drafts';
+  var BACKUPS_KEY = STORAGE_PREFIX + 'backups';
+  var OVERLAY_ID = 'opsHandoverOverlay';
+  var FIELD_IDS = [
+    'editorPrsntDrill', 'editorPrsntDrillAux',
+    'editorUpDrill', 'editorUpDrillAux',
+    'editorEuipDrill', 'editorEuipDrillAux',
+    'editorOtherDrill', 'editorOtherDrillAux'
+  ];
+  var LABELS = {
+    editorPrsntDrill: 'Present operations — main',
+    editorPrsntDrillAux: 'Present operations — auxiliary',
+    editorUpDrill: 'Upcoming operations — main',
+    editorUpDrillAux: 'Upcoming operations — auxiliary',
+    editorEuipDrill: 'Equipment status — main',
+    editorEuipDrillAux: 'Equipment status — auxiliary',
+    editorOtherDrill: 'Other comments — main',
+    editorOtherDrillAux: 'Other comments — auxiliary'
+  };
+  var root = document.getElementById(FORM_ID);
+  var fields;
+  var initial = {};
+  var currentSession;
+  var saveTimer;
+  var observer;
+
+  function routeIsCreate() {
+    return location.hash === ROUTE && !!document.getElementById(FORM_ID);
+  }
+
+  if (!routeIsCreate()) return;
+
+  fields = FIELD_IDS.map(function (id) { return document.getElementById(id); }).filter(Boolean);
+  if (!fields.length) return;
+
+  function read(key, fallback) {
+    try { var value = localStorage.getItem(key); return value ? JSON.parse(value) : fallback; }
+    catch (_) { return fallback; }
+  }
+  function write(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); return true; }
+    catch (_) { return false; }
+  }
+  function esc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+    });
+  }
+  function stamp() { return new Date().toISOString(); }
+  function textFor(el) { return el.innerHTML || ''; }
+  function snapshot() {
+    var data = {};
+    fields.forEach(function (el) { data[el.id] = textFor(el); });
+    return data;
+  }
+  function same(a, b) { return JSON.stringify(a || {}) === JSON.stringify(b || {}); }
+  function metadata() {
+    function val(id) { var el = document.getElementById(id); return el ? (el.textContent || '').trim() : ''; }
+    return {
+      rig: val('frmHOCreate_lblInstVal'),
+      crew: val('frmHOCreate_lblCrewDeptVal'),
+      date: val('frmHOCreate_lblDateVal'),
+      time: val('frmHOCreate_lblTimeVal')
+    };
+  }
+  function sessionId() {
+    var m = metadata();
+    return [location.origin, location.pathname, m.rig, m.crew, m.date, m.time].join('|');
+  }
+  function titleFor(id) {
+    var m = metadata();
+    return [m.rig || 'OPS', m.crew || 'Handover', m.date || new Date().toLocaleDateString()].join(' · ');
+  }
+  function getDraft() { return read(DRAFTS_KEY, {})[currentSession]; }
+  function setDraft(data) {
+    var all = read(DRAFTS_KEY, {});
+    all[currentSession] = { id: currentSession, title: titleFor(), updated: stamp(), data: data };
+    write(DRAFTS_KEY, all);
+  }
+  function getBackups() { return read(BACKUPS_KEY, []); }
+  function saveBackup(label) {
+    var data = snapshot();
+    var backups = getBackups();
+    var item = { id: 'backup-' + Date.now(), session: currentSession, title: label || titleFor(), created: stamp(), data: data };
+    backups.unshift(item);
+    write(BACKUPS_KEY, backups.slice(0, 50));
+    return item;
+  }
+  function removeInlineLimit(el) {
+    el.contentEditable = 'true';
+    el.removeAttribute('maxlength');
+    el.removeAttribute('onkeypress');
+    el.style.maxHeight = 'none';
+    el.style.height = 'clamp(150px, 18vh, 260px)';
+    el.style.minHeight = '150px';
+    el.style.overflowY = 'auto';
+    el.style.whiteSpace = 'pre-wrap';
+    el.style.overflowWrap = 'anywhere';
+  }
+  function applyData(data) {
+    if (!data) return;
+    fields.forEach(function (el) {
+      if (Object.prototype.hasOwnProperty.call(data, el.id)) {
+        el.innerHTML = data[el.id] || '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  }
+  function saveDraftNow() {
+    if (!routeIsCreate()) return;
+    setDraft(snapshot());
+    var status = document.getElementById('opsHandoverStatus');
+    if (status) status.textContent = 'Draft saved ' + new Date().toLocaleTimeString();
+  }
+  function saveDraft() { clearTimeout(saveTimer); saveTimer = setTimeout(saveDraftNow, 150); }
+  function download(filename, content) {
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([content], { type: 'application/json' }));
+    a.download = filename; a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+  }
+  function closeEditor() {
+    var overlay = document.getElementById(OVERLAY_ID);
+    if (overlay) overlay.remove();
+    if (observer) observer.disconnect();
+  }
+  function makeButton(text, cls, fn) {
+    var b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.className = cls; b.onclick = fn; return b;
+  }
+  function openEditor() {
+    var old = document.getElementById(OVERLAY_ID); if (old) old.remove();
+    var overlay = document.createElement('div'); overlay.id = OVERLAY_ID;
+    overlay.innerHTML = '<div class="opsHoCard"><div class="opsHoHead"><div><h2>OPS Handover</h2><div class="opsHoMeta">'
+      + esc(titleFor()) + '</div></div><button type="button" class="opsHoX" aria-label="Close">×</button></div>'
+      + '<div class="opsHoNotice">This local editor expands the fields and removes the page\'s client-side 1,000-character keypress limit. Changes are saved automatically in this browser.</div>'
+      + '<div id="opsHoFields"></div><div class="opsHoFoot"><span id="opsHandoverStatus">Draft recovered if available</span><span class="opsHoActions"></span></div></div>';
+    document.body.appendChild(overlay);
+    overlay.querySelector('.opsHoX').onclick = closeEditor;
+    var holder = overlay.querySelector('#opsHoFields');
+    fields.forEach(function (el) {
+      var row = document.createElement('section'); row.className = 'opsHoRow';
+      row.innerHTML = '<label>' + esc(LABELS[el.id] || el.id) + '</label><div class="opsHoEditor" contenteditable="true" spellcheck="true"></div>';
+      var ed = row.querySelector('.opsHoEditor'); ed.innerHTML = textFor(el); ed.dataset.sourceId = el.id;
+      ed.addEventListener('input', function () { el.innerHTML = ed.innerHTML; el.dispatchEvent(new Event('input', { bubbles: true })); saveDraft(); });
+      holder.appendChild(row);
+    });
+    var actions = overlay.querySelector('.opsHoActions');
+    actions.appendChild(makeButton('Download backup', 'opsHoBtn opsHoSecondary', function () {
+      var item = saveBackup('Manual backup — ' + titleFor());
+      download('OPS-Handover-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json', JSON.stringify(item, null, 2));
+      document.getElementById('opsHandoverStatus').textContent = 'Backup downloaded';
+    }));
+    actions.appendChild(makeButton('Save / Apply & Close', 'opsHoBtn opsHoPrimary', function () {
+      saveDraftNow(); closeEditor();
+    }));
+    actions.appendChild(makeButton('Submit for next shift', 'opsHoBtn opsHoSubmit', function () {
+      saveDraftNow(); closeEditor();
+      var submit = document.getElementById('frmHOCreate_btnSubmit'); if (submit) submit.click();
+    }));
+    overlay.querySelector('.opsHoCard').addEventListener('keydown', function (e) { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveDraftNow(); } });
+  }
+  function install() {
+    currentSession = sessionId();
+    fields.forEach(function (el) { initial[el.id] = textFor(el); removeInlineLimit(el); });
+    var oldDraft = getDraft();
+    if (oldDraft && !same(oldDraft.data, initial)) applyData(oldDraft.data);
+    fields.forEach(function (el) { el.addEventListener('input', saveDraft); });
+    observer = new MutationObserver(function () { if (!routeIsCreate()) closeEditor(); });
+    observer.observe(document.documentElement, { subtree: true, attributes: true, attributeFilter: ['id', 'style', 'class'] });
+    window.addEventListener('hashchange', function () { if (!routeIsCreate()) closeEditor(); }, { once: true });
+    openEditor();
+  }
+  install();
+})();
